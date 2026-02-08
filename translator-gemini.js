@@ -1,8 +1,8 @@
 import fs from 'fs';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
-import remarkGfm from 'remark-gfm';
 import remarkMdx from 'remark-mdx';
+import remarkGfm from 'remark-gfm'; // Standard Github Flavored Markdown
 import remarkFrontmatter from 'remark-frontmatter';
 import remarkDirective from 'remark-directive';
 import remarkStringify from 'remark-stringify';
@@ -11,8 +11,8 @@ import yaml from 'js-yaml';
 import { read } from 'to-vfile';
 import { reporter } from 'vfile-reporter';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import cliProgress from 'cli-progress'; // <--- New Import
-import colors from 'colors';            // <--- Optional: for colored output
+import cliProgress from 'cli-progress';
+import colors from 'colors';
 
 // ==========================================
 // 1. CONFIGURATION
@@ -28,7 +28,13 @@ const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 60000;
 
 // Initialize API
+if (!process.env.GEMINI_API_KEY) {
+  console.error("❌ Error: GEMINI_API_KEY is missing.");
+  process.exit(1);
+}
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Using 2.0 Flash as it is fast and smart
 const MODEL_NAME = "gemini-2.0-flash"; 
 const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
@@ -41,17 +47,18 @@ console.log(`🚀 Initializing with model: ${MODEL_NAME}`);
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ==========================================
-// 3. ROBUST TRANSLATION LOGIC
+// 3. TRANSLATION LOGIC
 // ==========================================
 
 async function translateTextWithGemini(text) {
   if (!text || !text.trim()) return text;
 
+  // Simple in-memory cache
   if (global.translationCache && global.translationCache[text]) {
     return global.translationCache[text];
   }
 
-  // 1. Updated Prompt: Explicitly forbid adding new formatting
+  // Strict prompt to prevent "Helpful" additions like backticks
   const prompt = `Translate the following technical documentation text into ${TARGET_LANG}. 
   
   RULES:
@@ -67,16 +74,14 @@ async function translateTextWithGemini(text) {
     try {
       const result = await model.generateContent(prompt);
       const response = await result.response;
-      
-      // 2. Cleaning: Remove surrounding quotes
       let translation = response.text().trim().replace(/^"|"$/g, '');
-
-      // 3. Safety Check: Remove "helpful" backticks added by Gemini
-      // If the original didn't have backticks, but the translation does, strip them.
+      
+      // Safety Check: Remove "helpful" backticks added by Gemini if original didn't have them
       if (!text.startsWith('`') && translation.startsWith('`') && translation.endsWith('`')) {
         translation = translation.slice(1, -1);
       }
       
+      // Cache success
       global.translationCache = global.translationCache || {};
       global.translationCache[text] = translation;
       
@@ -85,7 +90,7 @@ async function translateTextWithGemini(text) {
     } catch (error) {
       attempt++;
       
-      // ... (Rest of your error handling logic remains the same) ...
+      // Fatal Errors
       if (error.status === 400 || error.status === 401 || error.status === 404) return text; 
 
       const isRetryable = 
@@ -111,28 +116,28 @@ async function translateTextWithGemini(text) {
 // 4. PLUGINS
 // ==========================================
 
-/** 
- * Plugin to protect snake_case_variables from being escaped.
- * It converts them from 'text' to 'html' nodes (which output raw text)
- * ONLY if they are strictly alphanumeric + underscores.
+/**
+ * 1. Variable Protection Plugin
+ * Converts snake_case_variables to raw nodes so they are NOT escaped.
  */
 function protectVariablesPlugin() {
   return (tree) => {
     visit(tree, 'text', (node) => {
-      // Regex: Starts with char, contains underscore, only alphanum/underscore
-      // This ensures we don't accidentally unescape things like "_italic_" or "foo_bar*"
+      // Matches strings like "sys_log_enable" or "my_var_1"
+      // Must start with alphanumeric, contain underscore, end with alphanumeric
       const isSnakeCaseVariable = /^[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+$/.test(node.value);
       
       if (isSnakeCaseVariable) {
-        // Change type to 'html'. In remark-stringify, 'html' nodes are 
-        // printed literally without escaping characters like _.
-        // Since our regex ensures no < or >, this is safe for MDX.
-        node.type = 'html';
+        // 'html' nodes are printed raw by remark-stringify
+        node.type = 'html'; 
       }
     });
   };
 }
 
+/**
+ * 2. Main Translation Plugin
+ */
 function geminiTranslatePlugin() {
   return async (tree) => {
     const nodesToTranslate = [];
@@ -140,7 +145,7 @@ function geminiTranslatePlugin() {
     // --- PHASE 1: COLLECTION ---
     visit(tree, (node) => {
       // Skip protected blocks
-      if (['code', 'inlineCode', 'mdxjsEsm', 'mdxFlowExpression'].includes(node.type)) return 'skip';
+      if (['code', 'inlineCode', 'mdxjsEsm', 'mdxFlowExpression', 'html'].includes(node.type)) return 'skip';
 
       // Text
       if (node.type === 'text' && node.value.trim()) {
@@ -171,11 +176,9 @@ function geminiTranslatePlugin() {
 
     console.log(`Found ${nodesToTranslate.length} items to translate.`);
 
-    // --- PHASE 2: BATCH EXECUTION WITH BAR ---
-    
-    // Initialize Progress Bar
+    // --- PHASE 2: BATCH EXECUTION ---
     const bar = new cliProgress.SingleBar({
-        format: 'Translate |' + colors.cyan('{bar}') + '| {percentage}% || {value}/{total} Chunks || ETA: {eta}s',
+        format: 'Translate |' + colors.cyan('{bar}') + '| {percentage}% || {value}/{total} || ETA: {eta}s',
         barCompleteChar: '\u2588',
         barIncompleteChar: '\u2591',
         hideCursor: true
@@ -184,24 +187,20 @@ function geminiTranslatePlugin() {
     bar.start(nodesToTranslate.length, 0);
 
     const translationPromises = nodesToTranslate.map(async (item, index) => {
-      // Stagger initial requests
-      await sleep(index * 20); 
+      await sleep(index * 20); // Stagger requests
       
       const translatedText = await translateTextWithGemini(item.original);
       
-      // Update Node
       if (item.type === 'text') item.node.value = translatedText;
       else if (item.type === 'attribute') item.node.value = translatedText;
       else if (item.type === 'frontmatter') item.objRef[item.key] = translatedText;
 
-      // Increment Bar
       bar.increment();
     });
 
     await Promise.all(translationPromises);
-    
-    bar.stop(); // Stop the bar cleanly
-    console.log('\n'); // Add a newline so next logs don't overlap
+    bar.stop();
+    console.log('\n'); 
 
     // --- PHASE 3: FINALIZATION ---
     visit(tree, 'yaml', (node) => {
@@ -218,30 +217,23 @@ function geminiTranslatePlugin() {
 // ==========================================
 
 async function translateFile(filePath) {
-  if (!process.env.GEMINI_API_KEY) {
-    console.error("❌ Error: GEMINI_API_KEY is missing.");
-    process.exit(1);
-  }
-
   try {
     const file = await read(filePath);
     console.log(`📖 Reading ${filePath}...`);
 
-const processedFile = await unified()
+    const processedFile = await unified()
       .use(remarkParse)
-      .use(remarkGfm) // Keep this!
-      .use(remarkFrontmatter, ['yaml'])
-      .use(remarkDirective)
-      .use(remarkMdx)
-      .use(geminiTranslatePlugin)
-      .use(protectVariablesPlugin)
+      .use(remarkGfm)                    // Support Tables/Strikethrough
+      .use(remarkFrontmatter, ['yaml'])  // Support --- Frontmatter ---
+      .use(remarkDirective)              // Support ::: Admonitions :::
+      .use(remarkMdx)                    // Support <JSX />
+      .use(geminiTranslatePlugin)        // <--- The Translation Logic
+      .use(protectVariablesPlugin)       // <--- The Anti-Slash Logic
       .use(remarkStringify, { 
-        emphasis: '*',
+        emphasis: '*',                   // Cleanest formatting
+        strong: '*',
         bullet: '-',
-        fences: true,
-        unsafe: [
-          { char: '_', inConstruct: 'phrasing', safe: true } 
-        ]
+        fences: true 
       })
       .process(file);
 
@@ -257,5 +249,5 @@ const processedFile = await unified()
 }
 
 const fileName = process.argv[2];
-if (!fileName) console.log('Usage: node translator-progress.js <filename.mdx>');
+if (!fileName) console.log('Usage: node translator-final.js <filename.mdx>');
 else translateFile(fileName);
