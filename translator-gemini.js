@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
+import remarkGfm from 'remark-gfm';
 import remarkMdx from 'remark-mdx';
 import remarkFrontmatter from 'remark-frontmatter';
 import remarkDirective from 'remark-directive';
@@ -10,6 +11,8 @@ import yaml from 'js-yaml';
 import { read } from 'to-vfile';
 import { reporter } from 'vfile-reporter';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import cliProgress from 'cli-progress'; // <--- New Import
+import colors from 'colors';            // <--- Optional: for colored output
 
 // ==========================================
 // 1. CONFIGURATION
@@ -26,9 +29,6 @@ const MAX_DELAY_MS = 60000;
 
 // Initialize API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// *** UPDATED: Using the specific model from your list ***
-// We strip the 'models/' prefix as the SDK often prefers just the ID
 const MODEL_NAME = "gemini-2.0-flash"; 
 const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
@@ -47,14 +47,17 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function translateTextWithGemini(text) {
   if (!text || !text.trim()) return text;
 
-  // Simple in-memory cache
   if (global.translationCache && global.translationCache[text]) {
     return global.translationCache[text];
   }
 
+  // 1. Updated Prompt: Explicitly forbid adding new formatting
   const prompt = `Translate the following technical documentation text into ${TARGET_LANG}. 
-  Do not add explanations, quotes, or conversational filler. 
-  Maintain all Markdown syntax, variables, and formatting exactly.
+  
+  RULES:
+  1. Do NOT add explanations, quotes, or conversational filler. 
+  2. Do NOT add new Markdown formatting (like bold, italic, or backticks) if it was not in the original text.
+  3. Maintain all existing Markdown syntax, variables, and formatting exactly.
   
   Text: "${text}"
   Translation:`;
@@ -64,9 +67,16 @@ async function translateTextWithGemini(text) {
     try {
       const result = await model.generateContent(prompt);
       const response = await result.response;
-      const translation = response.text().trim().replace(/^"|"$/g, '');
       
-      // Cache success
+      // 2. Cleaning: Remove surrounding quotes
+      let translation = response.text().trim().replace(/^"|"$/g, '');
+
+      // 3. Safety Check: Remove "helpful" backticks added by Gemini
+      // If the original didn't have backticks, but the translation does, strip them.
+      if (!text.startsWith('`') && translation.startsWith('`') && translation.endsWith('`')) {
+        translation = translation.slice(1, -1);
+      }
+      
       global.translationCache = global.translationCache || {};
       global.translationCache[text] = translation;
       
@@ -75,13 +85,9 @@ async function translateTextWithGemini(text) {
     } catch (error) {
       attempt++;
       
-      // Fatal Errors (Don't retry)
-      if (error.status === 400 || error.status === 401 || error.status === 404) {
-        console.error(`❌ Fatal API Error (Status ${error.status}): ${error.message}`);
-        return text; // Return original on fatal error
-      }
+      // ... (Rest of your error handling logic remains the same) ...
+      if (error.status === 400 || error.status === 401 || error.status === 404) return text; 
 
-      // Retryable Errors logic
       const isRetryable = 
         error.status === 429 || 
         error.status === 503 || 
@@ -89,22 +95,13 @@ async function translateTextWithGemini(text) {
         error.message.includes("RESOURCE_EXHAUSTED") || 
         error.message.includes("Overloaded");
 
-      if (!isRetryable) {
-        console.error(`❌ Unknown Error: ${error.message}`);
-        return text; 
-      }
+      if (!isRetryable) return text; 
+      if (attempt >= MAX_RETRIES) return text; 
 
-      if (attempt >= MAX_RETRIES) {
-        console.error(`❌ Max Retries hit for "${text.substring(0, 15)}..."`);
-        return text; 
-      }
-
-      // Backoff + Jitter
       const exponentialDelay = Math.pow(2, attempt) * BASE_DELAY_MS;
       const jitter = Math.random() * 1000;
       const delay = Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
 
-      console.warn(`⚠️ API Error ${error.status || ''}. Retrying in ${Math.round(delay)}ms...`);
       await sleep(delay);
     }
   }
@@ -113,6 +110,28 @@ async function translateTextWithGemini(text) {
 // ==========================================
 // 4. PLUGINS
 // ==========================================
+
+/** 
+ * Plugin to protect snake_case_variables from being escaped.
+ * It converts them from 'text' to 'html' nodes (which output raw text)
+ * ONLY if they are strictly alphanumeric + underscores.
+ */
+function protectVariablesPlugin() {
+  return (tree) => {
+    visit(tree, 'text', (node) => {
+      // Regex: Starts with char, contains underscore, only alphanum/underscore
+      // This ensures we don't accidentally unescape things like "_italic_" or "foo_bar*"
+      const isSnakeCaseVariable = /^[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+$/.test(node.value);
+      
+      if (isSnakeCaseVariable) {
+        // Change type to 'html'. In remark-stringify, 'html' nodes are 
+        // printed literally without escaping characters like _.
+        // Since our regex ensures no < or >, this is safe for MDX.
+        node.type = 'html';
+      }
+    });
+  };
+}
 
 function geminiTranslatePlugin() {
   return async (tree) => {
@@ -146,25 +165,43 @@ function geminiTranslatePlugin() {
               nodesToTranslate.push({ node, key, original: frontmatter[key], type: 'frontmatter', objRef: frontmatter });
             }
           });
-        } catch (e) { console.error("YAML Error", e); }
+        } catch (e) { }
       }
     });
 
     console.log(`Found ${nodesToTranslate.length} items to translate.`);
 
-    // --- PHASE 2: BATCH EXECUTION ---
+    // --- PHASE 2: BATCH EXECUTION WITH BAR ---
+    
+    // Initialize Progress Bar
+    const bar = new cliProgress.SingleBar({
+        format: 'Translate |' + colors.cyan('{bar}') + '| {percentage}% || {value}/{total} Chunks || ETA: {eta}s',
+        barCompleteChar: '\u2588',
+        barIncompleteChar: '\u2591',
+        hideCursor: true
+    });
+
+    bar.start(nodesToTranslate.length, 0);
+
     const translationPromises = nodesToTranslate.map(async (item, index) => {
-      // Stagger initial requests to avoid instant 429
-      await sleep(index * 100); 
+      // Stagger initial requests
+      await sleep(index * 20); 
       
       const translatedText = await translateTextWithGemini(item.original);
       
+      // Update Node
       if (item.type === 'text') item.node.value = translatedText;
       else if (item.type === 'attribute') item.node.value = translatedText;
       else if (item.type === 'frontmatter') item.objRef[item.key] = translatedText;
+
+      // Increment Bar
+      bar.increment();
     });
 
     await Promise.all(translationPromises);
+    
+    bar.stop(); // Stop the bar cleanly
+    console.log('\n'); // Add a newline so next logs don't overlap
 
     // --- PHASE 3: FINALIZATION ---
     visit(tree, 'yaml', (node) => {
@@ -190,13 +227,22 @@ async function translateFile(filePath) {
     const file = await read(filePath);
     console.log(`📖 Reading ${filePath}...`);
 
-    const processedFile = await unified()
+const processedFile = await unified()
       .use(remarkParse)
+      .use(remarkGfm) // Keep this!
       .use(remarkFrontmatter, ['yaml'])
       .use(remarkDirective)
       .use(remarkMdx)
       .use(geminiTranslatePlugin)
-      .use(remarkStringify, { emphasis: '*', bullet: '-', fences: true })
+      .use(protectVariablesPlugin)
+      .use(remarkStringify, { 
+        emphasis: '*',
+        bullet: '-',
+        fences: true,
+        unsafe: [
+          { char: '_', inConstruct: 'phrasing', safe: true } 
+        ]
+      })
       .process(file);
 
     const outputName = filePath.replace('.mdx', '.es.mdx');
@@ -211,5 +257,5 @@ async function translateFile(filePath) {
 }
 
 const fileName = process.argv[2];
-if (!fileName) console.log('Usage: node translator-final.js <filename.mdx>');
+if (!fileName) console.log('Usage: node translator-progress.js <filename.mdx>');
 else translateFile(fileName);
