@@ -1,0 +1,30 @@
+{
+  "name": "translation-testing",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "StarRocks Documentation Translator",
+  "main": "translator.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "translate:zh": "node translator.js test.mdx zh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "cli-progress": "^3.12.0",
+    "colors": "^1.4.0",
+    "js-yaml": "^4.1.0",
+    "remark-directive": "^3.0.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.0",
+    "remark-mdx": "^3.0.0",
+    "remark-parse": "^11.0.0",
+    "remark-stringify": "^11.0.0",
+    "to-vfile": "^8.0.0",
+    "unified": "^11.0.0",
+    "unist-util-visit": "^5.0.0",
+    "vfile-reporter": "^8.0.0"
+  }
+}

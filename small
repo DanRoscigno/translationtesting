@@ -1,0 +1,279 @@
+---
+displayed_sidebar: docs
+---
+
+import FEConfigMethod from '../../_assets/commonMarkdown/FE_config_method.mdx'
+
+import AdminSetFrontendNote from '../../_assets/commonMarkdown/FE_config_note.mdx'
+
+import StaticFEConfigNote from '../../_assets/commonMarkdown/StaticFE_config_note.mdx'
+
+import EditionSpecificFEItem from '../../_assets/commonMarkdown/Edition_Specific_FE_Item.mdx'
+
+# FE Configuration
+
+<FEConfigMethod />
+
+## View FE configuration items
+
+After your FE is started, you can run the ADMIN SHOW FRONTEND CONFIG command on your MySQL client to check the parameter configurations. If you want to query the configuration of a specific parameter, run the following command:
+
+```SQL
+ADMIN SHOW FRONTEND CONFIG [LIKE "pattern"];
+```
+
+For detailed description of the returned fields, see [ADMIN SHOW CONFIG](../../sql-reference/sql-statements/cluster-management/config_vars/ADMIN_SHOW_CONFIG.md).
+
+:::note
+You must have administrator privileges to run cluster administration-related commands.
+:::
+
+## Configure FE parameters
+
+### Configure FE dynamic parameters
+
+You can configure or modify the settings of FE dynamic parameters using [ADMIN SET FRONTEND CONFIG](../../sql-reference/sql-statements/cluster-management/config_vars/ADMIN_SET_CONFIG.md).
+
+```SQL
+ADMIN SET FRONTEND CONFIG ("key" = "value");
+```
+
+<AdminSetFrontendNote />
+
+### Configure FE static parameters
+
+<StaticFEConfigNote />
+
+## Understand FE parameters
+
+### Logging
+
+##### audit_log_delete_age
+
+- Default: 30d
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The retention period of audit log files. The default value `30d` specifies that each audit log file can be retained for 30 days. StarRocks checks each audit log file and deletes those that were generated 30 days ago.
+- Introduced in: -
+
+##### audit_log_dir
+
+- Default: StarRocksFE.STARROCKS_HOME_DIR + "/log"
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The directory that stores audit log files.
+- Introduced in: -
+
+##### `audit_log_enable_compress`
+
+- Default: false
+- Type: Boolean
+- Unit: N/A
+- Is mutable: No
+- Description: When true, the generated Log4j2 configuration appends a ".gz" postfix to rotated audit log filenames (fe.audit.log.*) so that Log4j2 will produce compressed (.gz) archived audit log files on rollover. The setting is read during FE startup in Log4jConfig.initLogging and is applied to the RollingFile appender for audit logs; it only affects rotated/archived files, not the active audit log. Because the value is initialized at startup, changing it requires restarting the FE to take effect. Use alongside audit log rotation settings (audit_log_dir, audit_log_roll_interval, audit_roll_maxsize, audit_log_roll_num).
+- Introduced in: 3.2.12
+
+##### audit_log_json_format
+
+- Default: false
+- Type: Boolean
+- Unit: N/A
+- Is mutable: Yes
+- Description: When true, FE audit events are emitted as structured JSON (Jackson ObjectMapper serializing a Map of annotated AuditEvent fields) instead of the default pipe-separated "key=value" string. The setting affects all built-in audit sinks handled by AuditLogBuilder: connection audit, query audit, big-query audit (big-query threshold fields are added to the JSON when the event qualifies), and slow-audit output. Fields annotated for big-query thresholds and the "features" field are treated specially (excluded from normal audit entries; included in big-query or feature logs as applicable). Enable this to make logs machine-parsable for log collectors or SIEMs; note it changes the log format and may require updating any existing parsers that expect the legacy pipe-separated format.
+- Introduced in: 3.2.7
+
+##### audit_log_modules
+
+- Default: slow_query, query
+- Type: String[]
+- Unit: -
+- Is mutable: No
+- Description: The modules for which StarRocks generates audit log entries. By default, StarRocks generates audit logs for the `slow_query` module and the `query` module. The `connection` module is supported from v3.0. Separate the module names with a comma (,) and a space.
+- Introduced in: -
+
+##### audit_log_roll_interval
+
+- Default: DAY
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The time interval at which StarRocks rotates audit log entries. Valid values: `DAY` and `HOUR`.
+  - If this parameter is set to `DAY`, a suffix in the `yyyyMMdd` format is added to the names of audit log files.
+  - If this parameter is set to `HOUR`, a suffix in the `yyyyMMddHH` format is added to the names of audit log files.
+- Introduced in: -
+
+##### audit_log_roll_num
+
+- Default: 90
+- Type: Int
+- Unit: -
+- Is mutable: No
+- Description: The maximum number of audit log files that can be retained within each retention period specified by the `audit_log_roll_interval` parameter.
+- Introduced in: -
+
+##### bdbje_log_level
+
+- Default: INFO
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Controls the logging level used by Berkeley DB Java Edition (BDB JE) in StarRocks. During BDB environment initialization BDBEnvironment.initConfigs() applies this value to the Java logger for the `com.sleepycat.je` package and to the BDB JE environment file logging level (EnvironmentConfig.FILE_LOGGING_LEVEL). Accepts standard java.util.logging.Level names such as SEVERE, WARNING, INFO, CONFIG, FINE, FINER, FINEST, ALL, OFF. Setting to ALL enables all log messages. Increasing verbosity will raise log volume and may impact disk I/O and performance; the value is read when the BDB environment is initialized, so it takes effect only after environment (re)initialization.
+- Introduced in: v3.2.0
+
+##### big_query_log_delete_age
+
+- Default: 7d
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Controls how long FE big query log files (`fe.big_query.log.*`) are retained before automatic deletion. The value is passed to Log4j's deletion policy as the IfLastModified age — any rotated big query log whose last-modified time is older than this value will be removed. Supports suffixes include `d` (day), `h` (hour), `m` (minute), and `s` (second). Example: `7d` (7 days), `10h` (10 hours), `60m` (60 minutes), and `120s` (120 seconds). This item works together with `big_query_log_roll_interval` and `big_query_log_roll_num` to determine which files are kept or purged.
+- Introduced in: v3.2.0
+
+##### big_query_log_dir
+
+- Default: `Config.STARROCKS_HOME_DIR + "/log"`
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Directory where the FE writes big query dump logs (`fe.big_query.log.*`). The Log4j configuration uses this path to create a RollingFile appender for `fe.big_query.log` and its rotated files. Rotation and retention are governed by `big_query_log_roll_interval` (time-based suffix), `log_roll_size_mb` (size trigger), `big_query_log_roll_num` (max files), and `big_query_log_delete_age` (age-based deletion). Big query records are logged for queries that exceed user-defined thresholds such as `big_query_log_cpu_second_threshold`, `big_query_log_scan_rows_threshold`, or `big_query_log_scan_bytes_threshold`. Use `big_query_log_modules` to control which modules log to this file.
+- Introduced in: v3.2.0
+
+##### big_query_log_modules
+
+- Default: `{"query"}`
+- Type: String[]
+- Unit: -
+- Is mutable: No
+- Description: List of module name suffixes that enable per-module big query logging. Typical values are logical component names. For example, the default `query` produces `big_query.query`.
+- Introduced in: v3.2.0
+
+##### big_query_log_roll_interval
+
+- Default: `"DAY"`
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Specifies the time interval used to construct the date component of the rolling file name for the `big_query` log appender. Valid values (case-insensitive) are `DAY` (default) and `HOUR`. `DAY` produces a daily pattern (`"%d{yyyyMMdd}"`) and `HOUR` produces an hourly pattern (`"%d{yyyyMMddHH}"`). The value is combined with size-based rollover (`big_query_roll_maxsize`) and index-based rollover (`big_query_log_roll_num`) to form the RollingFile filePattern. An invalid value causes log configuration generation to fail (IOException) and may prevent log initialization or reconfiguration. Use alongside `big_query_log_dir`, `big_query_roll_maxsize`, `big_query_log_roll_num`, and `big_query_log_delete_age`.
+- Introduced in: v3.2.0
+
+##### big_query_log_roll_num
+
+- Default: 10
+- Type: Int
+- Unit: -
+- Is mutable: No
+- Description: Maximum number of rotated FE big query log files to retain per `big_query_log_roll_interval`. This value is bound to the RollingFile appender's DefaultRolloverStrategy `max` attribute for `fe.big_query.log`; when logs roll (by time or by `log_roll_size_mb`), StarRocks keeps up to `big_query_log_roll_num` indexed files (filePattern uses a time suffix plus index). Files older than this count may be removed by rollover, and `big_query_log_delete_age` can additionally delete files by last-modified age.
+- Introduced in: v3.2.0
+
+##### dump_log_delete_age
+
+- Default: 7d
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The retention period of dump log files. The default value `7d` specifies that each dump log file can be retained for 7 days. StarRocks checks each dump log file and deletes those that were generated 7 days ago.
+- Introduced in: -
+
+##### dump_log_dir
+
+- Default: StarRocksFE.STARROCKS_HOME_DIR + "/log"
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The directory that stores dump log files.
+- Introduced in: -
+
+##### dump_log_modules
+
+- Default: query
+- Type: String[]
+- Unit: -
+- Is mutable: No
+- Description: The modules for which StarRocks generates dump log entries. By default, StarRocks generates dump logs for the query module. Separate the module names with a comma (,) and a space.
+- Introduced in: -
+
+##### dump_log_roll_interval
+
+- Default: DAY
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: The time interval at which StarRocks rotates dump log entries. Valid values: `DAY` and `HOUR`.
+  - If this parameter is set to `DAY`, a suffix in the `yyyyMMdd` format is added to the names of dump log files.
+  - If this parameter is set to `HOUR`, a suffix in the `yyyyMMddHH` format is added to the names of dump log files.
+- Introduced in: -
+
+##### dump_log_roll_num
+
+- Default: 10
+- Type: Int
+- Unit: -
+- Is mutable: No
+- Description: The maximum number of dump log files that can be retained within each retention period specified by the `dump_log_roll_interval` parameter.
+- Introduced in: -
+
+##### edit_log_write_slow_log_threshold_ms
+
+- Default: 2000
+- Type: Int
+- Unit: Milliseconds
+- Is mutable: Yes
+- Description: Threshold (in ms) used by JournalWriter to detect and log slow edit-log batch writes. After a batch commit, if the batch duration exceeds this value, JournalWriter emits a WARN with batch size, duration and current journal queue size (rate-limited to once every ~2s). This setting only controls logging/alerts for potential IO or replication latency on the FE leader; it does not change commit or roll behavior (see `edit_log_roll_num` and commit-related settings). Metric updates still occur regardless of this threshold.
+- Introduced in: v3.2.3
+
+##### enable_audit_sql
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: No
+- Description: When this item is set to `true`, the FE audit subsystem records the SQL text of statements into FE audit logs (`fe.audit.log`) processed by ConnectProcessor. The stored statement respects other controls: encrypted statements are redacted (`AuditEncryptionChecker`), sensitive credentials may be redacted or desensitized if `enable_sql_desensitize_in_log` is set, and digest recording is controlled by `enable_sql_digest`. When it is set to `false`, ConnectProcessor replaces the statement text with "?" in audit events — other audit fields (user, host, duration, status, slow-query detection via `qe_slow_log_ms`, and metrics) are still recorded. Enabling SQL audit increases forensic and troubleshooting visibility but may expose sensitive SQL content and increase log volume and I/O; disabling it improves privacy at the cost of losing full-statement visibility in audit logs.
+- Introduced in: -
+
+##### enable_profile_log
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: No
+- Description: Whether to enable profile logging. When this feature is enabled, the FE writes per-query profile logs (the serialized `queryDetail` JSON produced by `ProfileManager`) to the profile log sink. This logging is performed only if `enable_collect_query_detail_info` is also enabled; when `enable_profile_log_compress` is enabled, the JSON may be gzipped before logging. Profile log files are managed by `profile_log_dir`, `profile_log_roll_num`, `profile_log_roll_interval` and rotated/deleted according to `profile_log_delete_age` (supports formats like `7d`, `10h`, `60m`, `120s`). Disabling this feature stops writing profile logs (reducing disk I/O, compression CPU and storage usage).
+- Introduced in: v3.2.5
+
+##### enable_qe_slow_log
+
+- Default: true
+- Type: Boolean
+- Unit: N/A
+- Is mutable: Yes
+- Description: When enabled, the FE builtin audit plugin (AuditLogBuilder) will write query events whose measured execution time ("Time" field) exceeds the threshold configured by qe_slow_log_ms into the slow-query audit log (AuditLog.getSlowAudit). If disabled, those slow-query entries are suppressed (regular query and connection audit logs are unaffected). The slow-audit entries follow the global audit_log_json_format setting (JSON vs. plain string). Use this flag to control generation of slow-query audit volume independently of regular audit logging; turning it off may reduce log I/O when qe_slow_log_ms is low or workloads produce many long-running queries.
+- Introduced in: 3.2.11
+
+##### enable_sql_desensitize_in_log
+
+- Default: false
+- Type: Boolean
+- Unit: -
+- Is mutable: No
+- Description: When this item is set to `true`, the system replaces or hides sensitive SQL content before it is written to logs and query-detail records. Code paths that honor this configuration include ConnectProcessor.formatStmt (audit logs), StmtExecutor.addRunningQueryDetail (query details), and SimpleExecutor.formatSQL (internal executor logs). With the feature enabled, invalid SQLs may be replaced with a fixed desensitized message, credentials (user/password) are hidden, and the SQL formatter is required to produce a sanitized representation (it can also enable digest-style output). This reduces leakage of sensitive literals and credentials in audit/internal logs but also means logs and query details no longer contain the original full SQL text (which can affect replay or debugging).
+- Introduced in: -
+
+##### internal_log_delete_age
+
+- Default: 7d
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Specifies the retention period for FE internal log files (written to `internal_log_dir`). The value is a duration string. Supported suffixes: `d` (day), `h` (hour), `m` (minute), `s` (second). Examples: `7d` (7 days), `10h` (10 hours), `60m` (60 minutes), `120s` (120 seconds). This item is substituted into the log4j configuration as the `<IfLastModified age="..."/>` predicate used by the RollingFile Delete policy. Files whose last-modified time is earlier than this duration will be removed during log rollover. Increase this value to free disk space sooner, or decrease it to retain internal materialized view or statistics logs longer.
+- Introduced in: v3.2.4
+
+##### internal_log_dir
+
+- Default: `Config.STARROCKS_HOME_DIR + "/log"`
+- Type: String
+- Unit: -
+- Is mutable: No
+- Description: Directory used by the FE logging subsystem for storing internal logs (`fe.internal.log`). This configuration is substituted into the Log4j configuration and determines where the InternalFile appender writes internal/materialized view/statistics logs and where per-module loggers under `internal.<module>` place their files. Ensure the directory exists, is writable, and has sufficient disk space. Log rotation and retention for files in this directory are controlled by `log_roll_size_mb`, `internal_log_roll_num`, `internal_log_delete_age`, and `internal_log_roll_interval`. If `sys_log_to_console` is enabled, internal logs may be written to console instead of this directory.
+- Introduced in: v3.2.4
+

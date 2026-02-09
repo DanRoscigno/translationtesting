@@ -1,8 +1,9 @@
 import fs from 'fs';
+import path from 'path';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkMdx from 'remark-mdx';
-import remarkGfm from 'remark-gfm'; // Standard Github Flavored Markdown
+import remarkGfm from 'remark-gfm';
 import remarkFrontmatter from 'remark-frontmatter';
 import remarkDirective from 'remark-directive';
 import remarkStringify from 'remark-stringify';
@@ -15,98 +16,191 @@ import cliProgress from 'cli-progress';
 import colors from 'colors';
 
 // ==========================================
-// 1. CONFIGURATION
+// 1. CONFIGURATION & ARGS
 // ==========================================
 
+// Get Args
+const fileName = process.argv[2];
+const langCode = process.argv[3]; // e.g., 'zh', 'ja', 'en'
+
+if (!fileName || !langCode) {
+  console.log('Usage: node translator.js <filename.mdx> <lang_code>');
+  console.log('Example: node translator.js doc.mdx zh');
+  process.exit(1);
+}
+
+// Language Map
+const LANGUAGE_CONFIG = {
+  zh: {
+    name: "Simplified Chinese",
+    dict: "./language_dicts/zh.yaml",
+    ext: ".zh.mdx"
+  },
+  ja: {
+    name: "Japanese",
+    dict: "./language_dicts/ja.yaml",
+    ext: ".ja.mdx"
+  },
+  en: {
+    name: "English",
+    dict: "./language_dicts/en.yaml", // Optional
+    ext: ".en.mdx"
+  }
+};
+
+const currentConfig = LANGUAGE_CONFIG[langCode];
+
+if (!currentConfig) {
+  console.error(`❌ Error: Unsupported language code '${langCode}'. Supported: zh, ja, en`);
+  process.exit(1);
+}
+
+const TARGET_LANG = currentConfig.name;
+const DICT_PATH = currentConfig.dict;
+const FORBIDDEN_PATH = './config/never_translate.yaml'; 
+
+// MDX Config
 const FRONTMATTER_KEYS = ['title', 'description', 'sidebar_label', 'summary'];
-const JSX_PROPS = ['title', 'label', 'alt', 'placeholder'];
-const TARGET_LANG = "Spanish"; 
+const JSX_PROPS = ['title', 'label', 'alt', 'placeholder', 'summary'];
 
 // API Config
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 60000;
+// Using the Reasoning Model for better instruction following
+const MODEL_NAME = "gemini-2.5-pro"; 
 
-// Initialize API
 if (!process.env.GEMINI_API_KEY) {
   console.error("❌ Error: GEMINI_API_KEY is missing.");
   process.exit(1);
 }
 
+// ==========================================
+// 2. SYSTEM PROMPT CONSTRUCTION
+// ==========================================
+
+function loadConfig() {
+  try {
+    // 1. Load Dictionary
+    let dictString = "No specific dictionary rules.";
+    if (fs.existsSync(DICT_PATH)) {
+      const dictYaml = yaml.load(fs.readFileSync(DICT_PATH, 'utf8'));
+      dictString = Object.entries(dictYaml)
+        .map(([key, val]) => `- ${key} -> ${val}`)
+        .join('\n');
+      console.log(`📚 Loaded dictionary: ${DICT_PATH}`);
+    } else {
+      console.warn(`⚠️ Dictionary not found at ${DICT_PATH}, proceeding without it.`);
+    }
+
+    // 2. Load Forbidden Terms
+    let forbiddenString = "No forbidden terms.";
+    if (fs.existsSync(FORBIDDEN_PATH)) {
+      const forbiddenYaml = yaml.load(fs.readFileSync(FORBIDDEN_PATH, 'utf8'));
+      forbiddenString = forbiddenYaml.map(term => `- ${term}`).join('\n');
+      console.log(`🚫 Loaded forbidden terms: ${FORBIDDEN_PATH}`);
+    }
+
+    return { dictString, forbiddenString };
+  } catch (e) {
+    console.error("❌ Error loading config YAMLs:", e);
+    process.exit(1);
+  }
+}
+
+const { dictString, forbiddenString } = loadConfig();
+
+// --- UPDATED POSITIVE-ONLY PROMPT ---
+const SYSTEM_INSTRUCTION = `
+You are a professional technical translator for StarRocks.
+Your target language is ${TARGET_LANG}.
+
+### DICTIONARY
+${dictString}
+
+### FORBIDDEN TERMS
+${forbiddenString}
+
+### TRANSLATION PATTERNS (CRITICAL)
+Follow these patterns exactly to handle mixed code and text:
+
+1. **Suffix Definitions:**
+   - **Context:** Lists where a code value is followed by a description in parentheses.
+   - **Source:** Supported suffixes: \`d\` (day), \`h\` (hour).
+   - **Target:** 支持的后缀：\`d\`（天），\`h\`（小时）。
+   - **Rule:** You MUST translate the description inside the parentheses.
+
+2. **Mixed Code & Text:**
+   - **Context:** Sentences containing variable names in backticks.
+   - **Source:** Specifies the retention period (written to \`internal_log_dir\`).
+   - **Target:** 指定保留期限（写入到 \`internal_log_dir\`）。
+   - **Rule:** Keep the code in backticks exactly as is, but translate the surrounding text.
+
+### CORE INSTRUCTION
+**TRANSLATE EVERYTHING.** Do not stop mid-sentence. If you are unsure about a specific technical term, keep it in English, but FINISH THE SENTENCE structure.
+`;
+
+// Initialize API with System Instruction
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Using 2.0 Flash as it is fast and smart
-const MODEL_NAME = "gemini-2.0-flash"; 
-const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+const model = genAI.getGenerativeModel({ 
+  model: MODEL_NAME,
+  systemInstruction: SYSTEM_INSTRUCTION,
+  generationConfig: {
+    temperature: 0.3, 
+    topP: 0.95,       // High topP to prevent truncation
+    topK: 40,
+    maxOutputTokens: 8192,
+  }
+});
 
-console.log(`🚀 Initializing with model: ${MODEL_NAME}`);
-
-// ==========================================
-// 2. HELPER FUNCTIONS
-// ==========================================
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+console.log(`🚀 Initializing ${MODEL_NAME} for target: ${TARGET_LANG}`);
 
 // ==========================================
 // 3. TRANSLATION LOGIC
 // ==========================================
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function translateTextWithGemini(text) {
   if (!text || !text.trim()) return text;
 
-  // Simple in-memory cache
-  if (global.translationCache && global.translationCache[text]) {
-    return global.translationCache[text];
+  // Cache check
+  const cacheKey = `${langCode}:${text}`;
+  if (global.translationCache && global.translationCache[cacheKey]) {
+    return global.translationCache[cacheKey];
   }
 
-  // Strict prompt to prevent "Helpful" additions like backticks
-  const prompt = `Translate the following technical documentation text into ${TARGET_LANG}. 
+  const userPrompt = `Translate the following text to ${TARGET_LANG}. Return ONLY the translation.
   
-  RULES:
-  1. Do NOT add explanations, quotes, or conversational filler. 
-  2. Do NOT add new Markdown formatting (like bold, italic, or backticks) if it was not in the original text.
-  3. Maintain all existing Markdown syntax, variables, and formatting exactly.
-  
-  Text: "${text}"
-  Translation:`;
+  Text: "${text}"`;
 
   let attempt = 0;
   while (attempt < MAX_RETRIES) {
     try {
-      const result = await model.generateContent(prompt);
+      const result = await model.generateContent(userPrompt);
       const response = await result.response;
       let translation = response.text().trim().replace(/^"|"$/g, '');
       
-      // Safety Check: Remove "helpful" backticks added by Gemini if original didn't have them
+      // Basic Safety: Remove added backticks if original didn't have them
       if (!text.startsWith('`') && translation.startsWith('`') && translation.endsWith('`')) {
         translation = translation.slice(1, -1);
       }
       
-      // Cache success
       global.translationCache = global.translationCache || {};
-      global.translationCache[text] = translation;
+      global.translationCache[cacheKey] = translation;
       
       return translation;
 
     } catch (error) {
       attempt++;
       
-      // Fatal Errors
       if (error.status === 400 || error.status === 401 || error.status === 404) return text; 
 
-      const isRetryable = 
-        error.status === 429 || 
-        error.status === 503 || 
-        error.status === 500 || 
-        error.message.includes("RESOURCE_EXHAUSTED") || 
-        error.message.includes("Overloaded");
-
+      const isRetryable = error.status === 429 || error.status === 503 || error.status === 500;
       if (!isRetryable) return text; 
       if (attempt >= MAX_RETRIES) return text; 
 
-      const exponentialDelay = Math.pow(2, attempt) * BASE_DELAY_MS;
-      const jitter = Math.random() * 1000;
-      const delay = Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
-
+      const delay = Math.min(Math.pow(2, attempt) * BASE_DELAY_MS + (Math.random() * 1000), MAX_DELAY_MS);
       await sleep(delay);
     }
   }
@@ -117,42 +211,72 @@ async function translateTextWithGemini(text) {
 // ==========================================
 
 /**
- * 1. Variable Protection Plugin
- * Converts snake_case_variables to raw nodes so they are NOT escaped.
+ * 1. Janitor Plugin: Cleans up formatting artifacts (Quotes, Spacing, Parentheses)
+ */
+function cleanupGeminiArtifactsPlugin() {
+  return (tree) => {
+    visit(tree, 'text', (node) => {
+      if (!node.value) return;
+
+      let text = node.value;
+
+      // 1. Unescape backticks (Fixes `\_` and `\` issues)
+      text = text.replace(/\\`/g, '`');
+      text = text.replace(/\\_/g, '_'); 
+
+      // 2. Strip Quotes around code
+      // Matches: " `code` " -> `code`
+      text = text.replace(/["“”]\s*(`[^`]+`)\s*["“”]/g, '$1');
+      // Matches: `code` " -> `code` (Trailing quote fix)
+      text = text.replace(/(`[^`]+`)\s*["“”]/g, '$1');
+      // Matches: " `code` -> `code` (Leading quote fix)
+      text = text.replace(/["“”]\s*(`[^`]+`)/g, '$1');
+
+      // 3. Fix Mixed Parentheses: （ English ) -> （ English ）
+      // Finds (Chinese Open + Content + English Close) and fixes it
+      text = text.replace(/（([^）]*?)\)/g, '（$1）');
+
+      // 4. Force CJK Spacing (The "Holy Grail" regex)
+      // Adds space between Chinese/Japanese and English/Numbers/Code
+      // Chinese -> English/Code
+      text = text.replace(/([\u4e00-\u9fa5\u3040-\u30ff])([a-zA-Z0-9`])/g, '$1 $2');
+      // English/Code -> Chinese
+      text = text.replace(/([a-zA-Z0-9`])([\u4e00-\u9fa5\u3040-\u30ff])/g, '$1 $2');
+
+      // 5. Final Polish: Remove double spaces created by regexes
+      text = text.replace(/  +/g, ' ');
+
+      node.value = text;
+    });
+  };
+}
+
+/**
+ * 2. Variable Protection Plugin: Prevents snake_case escaping
  */
 function protectVariablesPlugin() {
   return (tree) => {
     visit(tree, 'text', (node) => {
-      // Matches strings like "sys_log_enable" or "my_var_1"
-      // Must start with alphanumeric, contain underscore, end with alphanumeric
+      // Protect snake_case_variables from being escaped
       const isSnakeCaseVariable = /^[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+$/.test(node.value);
-      
       if (isSnakeCaseVariable) {
-        // 'html' nodes are printed raw by remark-stringify
         node.type = 'html'; 
       }
     });
   };
 }
 
-/**
- * 2. Main Translation Plugin
- */
 function geminiTranslatePlugin() {
   return async (tree) => {
     const nodesToTranslate = [];
 
-    // --- PHASE 1: COLLECTION ---
     visit(tree, (node) => {
-      // Skip protected blocks
       if (['code', 'inlineCode', 'mdxjsEsm', 'mdxFlowExpression', 'html'].includes(node.type)) return 'skip';
 
-      // Text
       if (node.type === 'text' && node.value.trim()) {
         nodesToTranslate.push({ node, original: node.value, type: 'text' });
       }
 
-      // JSX Attributes
       if ((node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') && node.attributes) {
         node.attributes.forEach(attr => {
           if (attr.type === 'mdxJsxAttribute' && JSX_PROPS.includes(attr.name) && typeof attr.value === 'string') {
@@ -161,7 +285,6 @@ function geminiTranslatePlugin() {
         });
       }
 
-      // Frontmatter
       if (node.type === 'yaml') {
         try {
           const frontmatter = yaml.load(node.value);
@@ -176,7 +299,6 @@ function geminiTranslatePlugin() {
 
     console.log(`Found ${nodesToTranslate.length} items to translate.`);
 
-    // --- PHASE 2: BATCH EXECUTION ---
     const bar = new cliProgress.SingleBar({
         format: 'Translate |' + colors.cyan('{bar}') + '| {percentage}% || {value}/{total} || ETA: {eta}s',
         barCompleteChar: '\u2588',
@@ -186,23 +308,22 @@ function geminiTranslatePlugin() {
 
     bar.start(nodesToTranslate.length, 0);
 
-    const translationPromises = nodesToTranslate.map(async (item, index) => {
-      await sleep(index * 20); // Stagger requests
-      
-      const translatedText = await translateTextWithGemini(item.original);
-      
-      if (item.type === 'text') item.node.value = translatedText;
-      else if (item.type === 'attribute') item.node.value = translatedText;
-      else if (item.type === 'frontmatter') item.objRef[item.key] = translatedText;
+    // BATCH PROCESSING
+    const BATCH_SIZE = 10; 
+    for (let i = 0; i < nodesToTranslate.length; i += BATCH_SIZE) {
+        const batch = nodesToTranslate.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map(async (item) => {
+            const translatedText = await translateTextWithGemini(item.original);
+            if (item.type === 'text') item.node.value = translatedText;
+            else if (item.type === 'attribute') item.node.value = translatedText;
+            else if (item.type === 'frontmatter') item.objRef[item.key] = translatedText;
+            bar.increment();
+        }));
+    }
 
-      bar.increment();
-    });
-
-    await Promise.all(translationPromises);
     bar.stop();
     console.log('\n'); 
 
-    // --- PHASE 3: FINALIZATION ---
     visit(tree, 'yaml', (node) => {
       const linkedItem = nodesToTranslate.find(i => i.type === 'frontmatter' && i.node === node);
       if (linkedItem) {
@@ -223,21 +344,29 @@ async function translateFile(filePath) {
 
     const processedFile = await unified()
       .use(remarkParse)
-      .use(remarkGfm)                    // Support Tables/Strikethrough
-      .use(remarkFrontmatter, ['yaml'])  // Support --- Frontmatter ---
-      .use(remarkDirective)              // Support ::: Admonitions :::
-      .use(remarkMdx)                    // Support <JSX />
-      .use(geminiTranslatePlugin)        // <--- The Translation Logic
-      .use(protectVariablesPlugin)       // <--- The Anti-Slash Logic
+      .use(remarkGfm)
+      .use(remarkFrontmatter, ['yaml'])
+      .use(remarkDirective)
+      .use(remarkMdx)
+      .use(geminiTranslatePlugin)
+      // --- CLEANUP & PROTECTION ---
+      .use(cleanupGeminiArtifactsPlugin) // 1. Clean garbage
+      .use(protectVariablesPlugin)       // 2. Protect variables
+      // ----------------------------
       .use(remarkStringify, { 
-        emphasis: '*',                   // Cleanest formatting
+        emphasis: '*',
         strong: '*',
         bullet: '-',
-        fences: true 
+        fences: true,
+        unsafe: [
+          { char: '_', inConstruct: 'phrasing', safe: true },
+          { char: '<', inConstruct: 'phrasing', safe: true },
+          { char: '>', inConstruct: 'phrasing', safe: true } 
+        ]
       })
       .process(file);
 
-    const outputName = filePath.replace('.mdx', '.es.mdx');
+    const outputName = filePath.replace('.mdx', currentConfig.ext);
     fs.writeFileSync(outputName, String(processedFile));
     
     console.log(reporter(processedFile));
@@ -248,6 +377,4 @@ async function translateFile(filePath) {
   }
 }
 
-const fileName = process.argv[2];
-if (!fileName) console.log('Usage: node translator-final.js <filename.mdx>');
-else translateFile(fileName);
+translateFile(fileName);
