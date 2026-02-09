@@ -2,7 +2,7 @@ import fs from 'fs';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkMdx from 'remark-mdx';
-import remarkGfm from 'remark-gfm'; // Standard Github Flavored Markdown
+import remarkGfm from 'remark-gfm'; 
 import remarkFrontmatter from 'remark-frontmatter';
 import remarkDirective from 'remark-directive';
 import remarkStringify from 'remark-stringify';
@@ -15,30 +15,55 @@ import cliProgress from 'cli-progress';
 import colors from 'colors';
 
 // ==========================================
-// 1. CONFIGURATION
+// 1. CONFIGURATION & ARGS
 // ==========================================
+
+const fileName = process.argv[2];
+const langCode = process.argv[3]; 
+
+if (!fileName || !langCode) {
+  console.log('Usage: node translator-gemini.js <filename.mdx> <lang_code>');
+  console.log('Example: node translator-gemini.js doc.mdx zh');
+  process.exit(1);
+}
+
+const LANG_MAP = {
+  'zh': 'Simplified Chinese',
+  'ja': 'Japanese',
+  'en': 'English'
+};
+
+const TARGET_LANG = LANG_MAP[langCode];
+if (!TARGET_LANG) {
+  console.error(`❌ Error: Unsupported language code '${langCode}'. Use zh, ja, or en.`);
+  process.exit(1);
+}
 
 const FRONTMATTER_KEYS = ['title', 'description', 'sidebar_label', 'summary'];
 const JSX_PROPS = ['title', 'label', 'alt', 'placeholder'];
-const TARGET_LANG = "Spanish"; 
 
-// API Config
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1000;
 const MAX_DELAY_MS = 60000;
 
-// Initialize API
 if (!process.env.GEMINI_API_KEY) {
   console.error("❌ Error: GEMINI_API_KEY is missing.");
   process.exit(1);
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Using 2.0 Flash as it is fast and smart
-const MODEL_NAME = "gemini-2.0-flash"; 
-const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+const MODEL_NAME = "gemini-2.5-pro"; 
+const model = genAI.getGenerativeModel({ 
+  model: MODEL_NAME,
+  generationConfig: {
+    temperature: 0.3,
+    topP: 0.95, 
+    topK: 40,
+    maxOutputTokens: 8192,
+  }
+});
 
-console.log(`🚀 Initializing with model: ${MODEL_NAME}`);
+console.log(`🚀 Initializing with model: ${MODEL_NAME} for ${TARGET_LANG}`);
 
 // ==========================================
 // 2. HELPER FUNCTIONS
@@ -53,18 +78,17 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 async function translateTextWithGemini(text) {
   if (!text || !text.trim()) return text;
 
-  // Simple in-memory cache
   if (global.translationCache && global.translationCache[text]) {
     return global.translationCache[text];
   }
 
-  // Strict prompt to prevent "Helpful" additions like backticks
   const prompt = `Translate the following technical documentation text into ${TARGET_LANG}. 
   
   RULES:
   1. Do NOT add explanations, quotes, or conversational filler. 
   2. Do NOT add new Markdown formatting (like bold, italic, or backticks) if it was not in the original text.
   3. Maintain all existing Markdown syntax, variables, and formatting exactly.
+  4. If you see code like \`d\` (day), translate the text in parentheses: \`d\`（天）.
   
   Text: "${text}"
   Translation:`;
@@ -76,12 +100,12 @@ async function translateTextWithGemini(text) {
       const response = await result.response;
       let translation = response.text().trim().replace(/^"|"$/g, '');
       
-      // Safety Check: Remove "helpful" backticks added by Gemini if original didn't have them
       if (!text.startsWith('`') && translation.startsWith('`') && translation.endsWith('`')) {
         translation = translation.slice(1, -1);
       }
       
-      // Cache success
+      if (!translation || translation.trim() === '') return text;
+
       global.translationCache = global.translationCache || {};
       global.translationCache[text] = translation;
       
@@ -89,24 +113,11 @@ async function translateTextWithGemini(text) {
 
     } catch (error) {
       attempt++;
-      
-      // Fatal Errors
       if (error.status === 400 || error.status === 401 || error.status === 404) return text; 
-
-      const isRetryable = 
-        error.status === 429 || 
-        error.status === 503 || 
-        error.status === 500 || 
-        error.message.includes("RESOURCE_EXHAUSTED") || 
-        error.message.includes("Overloaded");
-
+      const isRetryable = error.status === 429 || error.status === 503 || error.status === 500; 
       if (!isRetryable) return text; 
       if (attempt >= MAX_RETRIES) return text; 
-
-      const exponentialDelay = Math.pow(2, attempt) * BASE_DELAY_MS;
-      const jitter = Math.random() * 1000;
-      const delay = Math.min(exponentialDelay + jitter, MAX_DELAY_MS);
-
+      const delay = Math.min(Math.pow(2, attempt) * BASE_DELAY_MS + (Math.random() * 1000), MAX_DELAY_MS);
       await sleep(delay);
     }
   }
@@ -117,42 +128,149 @@ async function translateTextWithGemini(text) {
 // ==========================================
 
 /**
- * 1. Variable Protection Plugin
- * Converts snake_case_variables to raw nodes so they are NOT escaped.
+ * GLOBAL SNAKE CASE PROTECTOR
+ * Scans ALL text nodes. If it finds a snake_case word, it converts it to inlineCode.
+ * This prevents translation AND enforces backticks.
  */
-function protectVariablesPlugin() {
+function snakeCaseToCodePlugin() {
   return (tree) => {
-    visit(tree, 'text', (node) => {
-      // Matches strings like "sys_log_enable" or "my_var_1"
-      // Must start with alphanumeric, contain underscore, end with alphanumeric
-      const isSnakeCaseVariable = /^[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+$/.test(node.value);
+    visit(tree, 'text', (node, index, parent) => {
+      // Regex: strictly snake_case (letters/nums, underscore, letters/nums)
+      const regex = /\b[a-zA-Z0-9]+(_[a-zA-Z0-9]+)+\b/g;
       
-      if (isSnakeCaseVariable) {
-        // 'html' nodes are printed raw by remark-stringify
-        node.type = 'html'; 
+      if (!regex.test(node.value)) return;
+
+      const parts = [];
+      let lastIndex = 0;
+      let match;
+
+      regex.lastIndex = 0;
+      while ((match = regex.exec(node.value)) !== null) {
+        if (match.index > lastIndex) {
+          parts.push({ type: 'text', value: node.value.slice(lastIndex, match.index) });
+        }
+        parts.push({ type: 'inlineCode', value: match[0] });
+        lastIndex = regex.lastIndex;
       }
+      if (lastIndex < node.value.length) {
+        parts.push({ type: 'text', value: node.value.slice(lastIndex) });
+      }
+
+      parent.children.splice(index, 1, ...parts);
+      return index + parts.length;
     });
   };
 }
 
 /**
- * 2. Main Translation Plugin
+ * UNIVERSAL JANITOR PLUGIN (CONTEXT AWARE)
+ * Clean up formatting artifacts, considering sibling nodes for context.
  */
+/**
+ * UNIVERSAL JANITOR PLUGIN (CONTEXT AWARE)
+ * Clean up formatting artifacts, considering sibling nodes for context.
+ */
+function cleanupGeminiArtifactsPlugin(options = { lang: 'zh' }) {
+  return (tree) => {
+    visit(tree, 'text', (node, index, parent) => {
+      if (!node.value) return;
+      let text = node.value;
+      const lang = options.lang;
+
+      // 1. Unescape Backticks & Fix Glued Code
+      // Fixes: \`code\` -> `code`
+      text = text.replace(/\\`/g, '`'); 
+      // Fixes: `code``code` -> `code` `code`
+      text = text.replace(/`\s*`/g, '` `');   
+
+      // 2. Context Aware Quote Stripping
+      if (parent && parent.children) {
+        const prev = index > 0 ? parent.children[index - 1] : null;
+        const next = index < parent.children.length - 1 ? parent.children[index + 1] : null;
+
+        // Strip Trailing Quote if Next is Code: ...”`code`
+        if (next && next.type === 'inlineCode') {
+          text = text.replace(/["“”]\s*$/, ''); 
+        }
+        // Strip Leading Quote if Prev is Code: `code`”...
+        if (prev && prev.type === 'inlineCode') {
+          text = text.replace(/^\s*["“”]/, '');
+        }
+      }
+
+      // Standard Quote Cleanup (within single text node)
+      // Fixes: ”`d` -> `d` (Added ” to the regex)
+      text = text.replace(/["“”]\s*(`[^`]+`)/g, '$1'); 
+      text = text.replace(/(`[^`]+`)\s*["“”]/g, '$1'); 
+
+      if (lang === 'zh' || lang === 'ja') {
+        const cjkRegex = lang === 'zh' ? /[\u4e00-\u9fa5]/ : /[\u4e00-\u9fa5\u3040-\u30ff]/; 
+
+        // 3. Fix Mixed Parentheses (Aggressive)
+        // Trigger if contains CJK OR Numbers (Fixes "(7 days)")
+        const contentPattern = `(?:${cjkRegex.source}|[0-9])`; 
+        const parenRegex = new RegExp(`\\(([^)]*?${contentPattern}+[^)]*?)\\)`, 'g');
+        
+        text = text.replace(parenRegex, '（$1）'); 
+        text = text.replace(/（([^）]*?)\)/g, '（$1）');
+        text = text.replace(/\(([^)]*?)\）/g, '（$1）');
+
+        // 4. Fix Orphan Parentheses (Context Aware)
+        if (parent && parent.children) {
+          const prev = index > 0 ? parent.children[index - 1] : null;
+          const next = index < parent.children.length - 1 ? parent.children[index + 1] : null;
+
+          if (text.startsWith(')') && prev && prev.type === 'inlineCode') {
+              text = text.replace(/^\)/, '）');
+          }
+          if (text.endsWith('(') && next && next.type === 'inlineCode') {
+              text = text.replace(/\($/, '（');
+          }
+          
+          // 5. Fix XML Spacing (Context Aware)
+          if (prev && (prev.type === 'html' || prev.type === 'mdxJsxFlowElement' || prev.type === 'inlineCode')) {
+             if (/^[a-zA-Z0-9\u4e00-\u9fa5]/.test(text)) {
+                text = ' ' + text;
+             }
+          }
+        }
+
+        // Standard in-text replacement for XML
+        text = text.replace(/>([a-zA-Z0-9\u4e00-\u9fa5])/g, '> $1');
+
+        // 6. Fix CJK Spacing
+        text = text.replace(/([\u4e00-\u9fa5\u3040-\u30ff])([a-zA-Z0-9`])/g, '$1 $2');
+        text = text.replace(/([a-zA-Z0-9`])([\u4e00-\u9fa5\u3040-\u30ff])/g, '$1 $2');
+
+        // 7. Fix Periods
+        const periodRegex = new RegExp(`(${cjkRegex.source})\\.`, 'g');
+        text = text.replace(periodRegex, '$1。');
+      }
+
+      if (lang === 'en') {
+        text = text.replace(/（([^）]*?)）/g, '($1)');
+        text = text.replace(/。/g, '. ');
+        text = text.replace(/，/g, ', ');
+        text = text.replace(/：/g, ': ');
+      }
+
+      text = text.replace(/  +/g, ' ');
+      node.value = text;
+    });
+  };
+}
+
 function geminiTranslatePlugin() {
   return async (tree) => {
     const nodesToTranslate = [];
 
-    // --- PHASE 1: COLLECTION ---
     visit(tree, (node) => {
-      // Skip protected blocks
       if (['code', 'inlineCode', 'mdxjsEsm', 'mdxFlowExpression', 'html'].includes(node.type)) return 'skip';
 
-      // Text
       if (node.type === 'text' && node.value.trim()) {
         nodesToTranslate.push({ node, original: node.value, type: 'text' });
       }
 
-      // JSX Attributes
       if ((node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') && node.attributes) {
         node.attributes.forEach(attr => {
           if (attr.type === 'mdxJsxAttribute' && JSX_PROPS.includes(attr.name) && typeof attr.value === 'string') {
@@ -161,7 +279,6 @@ function geminiTranslatePlugin() {
         });
       }
 
-      // Frontmatter
       if (node.type === 'yaml') {
         try {
           const frontmatter = yaml.load(node.value);
@@ -176,7 +293,6 @@ function geminiTranslatePlugin() {
 
     console.log(`Found ${nodesToTranslate.length} items to translate.`);
 
-    // --- PHASE 2: BATCH EXECUTION ---
     const bar = new cliProgress.SingleBar({
         format: 'Translate |' + colors.cyan('{bar}') + '| {percentage}% || {value}/{total} || ETA: {eta}s',
         barCompleteChar: '\u2588',
@@ -187,14 +303,11 @@ function geminiTranslatePlugin() {
     bar.start(nodesToTranslate.length, 0);
 
     const translationPromises = nodesToTranslate.map(async (item, index) => {
-      await sleep(index * 20); // Stagger requests
-      
+      await sleep(index * 20); 
       const translatedText = await translateTextWithGemini(item.original);
-      
       if (item.type === 'text') item.node.value = translatedText;
       else if (item.type === 'attribute') item.node.value = translatedText;
       else if (item.type === 'frontmatter') item.objRef[item.key] = translatedText;
-
       bar.increment();
     });
 
@@ -202,7 +315,6 @@ function geminiTranslatePlugin() {
     bar.stop();
     console.log('\n'); 
 
-    // --- PHASE 3: FINALIZATION ---
     visit(tree, 'yaml', (node) => {
       const linkedItem = nodesToTranslate.find(i => i.type === 'frontmatter' && i.node === node);
       if (linkedItem) {
@@ -223,21 +335,34 @@ async function translateFile(filePath) {
 
     const processedFile = await unified()
       .use(remarkParse)
-      .use(remarkGfm)                    // Support Tables/Strikethrough
-      .use(remarkFrontmatter, ['yaml'])  // Support --- Frontmatter ---
-      .use(remarkDirective)              // Support ::: Admonitions :::
-      .use(remarkMdx)                    // Support <JSX />
-      .use(geminiTranslatePlugin)        // <--- The Translation Logic
-      .use(protectVariablesPlugin)       // <--- The Anti-Slash Logic
+      .use(remarkGfm)
+      .use(remarkFrontmatter, ['yaml'])
+      .use(remarkDirective)
+      .use(remarkMdx)
+
+      // --- STEP 1: PROTECT SNAKE_CASE ---
+      .use(snakeCaseToCodePlugin) 
+      
+      // --- STEP 2: TRANSLATE ---
+      .use(geminiTranslatePlugin)
+      
+      // --- STEP 3: CLEANUP ---
+      .use(cleanupGeminiArtifactsPlugin, { lang: langCode })
+      
       .use(remarkStringify, { 
-        emphasis: '*',                   // Cleanest formatting
+        emphasis: '*',
         strong: '*',
         bullet: '-',
-        fences: true 
+        fences: true,
+        unsafe: [
+          { char: '_', inConstruct: 'phrasing', safe: true }, 
+          { char: '<', inConstruct: 'phrasing', safe: true },
+          { char: '>', inConstruct: 'phrasing', safe: true } 
+        ]
       })
       .process(file);
 
-    const outputName = filePath.replace('.mdx', '.es.mdx');
+    const outputName = filePath.replace('.mdx', `.${langCode}.mdx`).replace('.md', `.${langCode}.md`);
     fs.writeFileSync(outputName, String(processedFile));
     
     console.log(reporter(processedFile));
@@ -248,6 +373,4 @@ async function translateFile(filePath) {
   }
 }
 
-const fileName = process.argv[2];
-if (!fileName) console.log('Usage: node translator-final.js <filename.mdx>');
-else translateFile(fileName);
+translateFile(fileName);
